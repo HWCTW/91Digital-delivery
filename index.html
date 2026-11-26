@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>91APP 數位發送整理工具</title>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <style>
+    :root { --navy:#163a5f; --blue:#2563a8; --pale:#eef5fc; --ink:#182433; --muted:#5e6c7c; --line:#d8e1ea; --danger:#b42318; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:#f5f7fa; color:var(--ink); font:15px/1.55 "Microsoft JhengHei", "Noto Sans TC", Arial, sans-serif; }
+    main { width:min(880px, calc(100% - 32px)); margin:48px auto; }
+    h1 { margin:0 0 8px; color:var(--navy); font-size:28px; }
+    .lead { margin:0 0 28px; color:var(--muted); }
+    .card { background:#fff; border:1px solid var(--line); border-radius:12px; padding:28px; box-shadow:0 8px 30px rgba(22,58,95,.06); }
+    .drop { display:block; padding:30px 20px; border:2px dashed #9cb9d5; border-radius:10px; background:var(--pale); text-align:center; cursor:pointer; transition:.15s; }
+    .drop:hover, .drop.drag { border-color:var(--blue); background:#e2effb; }
+    .drop strong { display:block; color:var(--navy); font-size:17px; }
+    .drop span { color:var(--muted); font-size:13px; }
+    input[type=file] { display:none; }
+    .file-name { min-height:24px; margin:14px 0 0; color:var(--blue); font-weight:700; }
+    button { margin-top:20px; padding:11px 20px; border:0; border-radius:7px; background:var(--blue); color:white; font:inherit; font-weight:700; cursor:pointer; }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    .result { display:none; margin-top:20px; padding:14px 16px; border-radius:8px; background:#ecfdf3; color:#126b3a; }
+    .result.error { background:#fef3f2; color:var(--danger); }
+    h2 { margin:30px 0 10px; color:var(--navy); font-size:18px; }
+    ul { margin:8px 0; padding-left:22px; }
+    code { padding:1px 5px; border-radius:4px; background:#f0f3f6; font-family:Consolas, monospace; }
+    .note { margin-top:22px; color:var(--muted); font-size:13px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>91APP 數位發送整理工具</h1>
+    <p class="lead">選取原始訂單檔，整理完成後會自動下載 Excel 檔。</p>
+    <section class="card">
+      <label class="drop" id="dropZone" for="fileInput">
+        <strong>點擊選擇檔案，或將檔案拖曳到此處</strong>
+        <span>支援 .xlsx、.xlsm、.xlsb、.xltx、.xltm、.xls、.csv、.txt</span>
+      </label>
+      <input id="fileInput" type="file" accept=".xlsx,.xlsm,.xlsb,.xltx,.xltm,.xls,.csv,.txt">
+      <div class="file-name" id="fileName"></div>
+      <button id="processButton" disabled>整理並下載 .xlsx</button>
+      <div class="result" id="result" role="status"></div>
+
+      <h2>整理規則</h2>
+      <ul>
+        <li>排除「訂單狀態」為 <code>已取消</code> 的資料列。</li>
+        <li>在原本 R 欄「商品單價」左方插入 R 欄「商品定價」，原商品單價移至 S 欄，並在 T 欄新增「活動折扣」。</li>
+        <li>商品定價依「商品料號」對照指定售價；未在對照表的料號會保留空白，並在完成訊息中提示筆數。</li>
+        <li>活動折扣 =（商品定價 − 商品單價）× 數量。同一「主單編號」的活動折扣會加總至該主單的第一列，其餘列填 0。</li>
+      </ul>
+      <p class="note">此工具只在您的瀏覽器內讀取與處理資料。CSV／TXT 會自動辨識 UTF-8 或 Big5 編碼；首次開啟需要網路載入 Excel 解析元件。</p>
+    </section>
+  </main>
+  <script>
+    (() => {
+      const PRICE_MAP = Object.freeze({
+        CP00000155: 1120, CP00000154: 875, CP00000153: 770, CP00000152: 560,
+        CP00000134: 1015, CP00000132: 1015, CP00000130: 840, CP00000128: 840
+      });
+      const fileInput = document.getElementById('fileInput');
+      const fileName = document.getElementById('fileName');
+      const processButton = document.getElementById('processButton');
+      const result = document.getElementById('result');
+      const dropZone = document.getElementById('dropZone');
+      let selectedFile;
+
+      const normal = value => String(value ?? '').trim();
+      const sku = value => normal(value).replace(/^'+/, '');
+      const number = value => {
+        if (typeof value === 'number') return value;
+        const parsed = Number(normal(value).replace(/,/g, ''));
+        return Number.isFinite(parsed) ? parsed : 0;
+      };
+      const show = (message, error = false) => {
+        result.textContent = message;
+        result.className = error ? 'result error' : 'result';
+        result.style.display = 'block';
+      };
+      const setFile = file => {
+        selectedFile = file;
+        fileName.textContent = file ? `已選取：${file.name}` : '';
+        processButton.disabled = !file;
+        result.style.display = 'none';
+      };
+      fileInput.addEventListener('change', event => setFile(event.target.files[0]));
+      ['dragenter', 'dragover'].forEach(type => dropZone.addEventListener(type, event => { event.preventDefault(); dropZone.classList.add('drag'); }));
+      ['dragleave', 'drop'].forEach(type => dropZone.addEventListener(type, event => { event.preventDefault(); dropZone.classList.remove('drag'); }));
+      dropZone.addEventListener('drop', event => setFile(event.dataTransfer.files[0]));
+
+      // 91APP 匯出的 CSV 常為 Big5；Excel 檔則交由 SheetJS 依原生格式讀取。
+      function readTextFile(buffer) {
+        const bytes = new Uint8Array(buffer);
+        const hasUtf8Bom = bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF;
+        try {
+          return new TextDecoder('utf-8', { fatal: !hasUtf8Bom }).decode(bytes);
+        } catch {
+          return new TextDecoder('big5').decode(bytes);
+        }
+      }
+      function isTextFile(fileName) {
+        return /\.(csv|txt)$/i.test(fileName);
+      }
+
+      function findHeaderRow(rows) {
+        return rows.findIndex(row => row.some(value => normal(value) === '主單編號') && row.some(value => normal(value) === '商品料號') && row.some(value => normal(value) === '訂單狀態'));
+      }
+      function transformSheet(sheet) {
+        const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null, raw: true });
+        const headerRow = findHeaderRow(rows);
+        if (headerRow < 0) return { changed: false };
+        const header = rows[headerRow];
+        const orderIndex = header.findIndex(value => normal(value) === '主單編號');
+        const skuIndex = header.findIndex(value => normal(value) === '商品料號');
+        const quantityIndex = header.findIndex(value => normal(value) === '數量');
+        const unitPriceIndex = header.findIndex(value => normal(value) === '商品單價');
+        const statusIndex = header.findIndex(value => normal(value) === '訂單狀態');
+        if ([orderIndex, skuIndex, quantityIndex, unitPriceIndex, statusIndex].some(index => index < 0)) {
+          throw new Error('找不到必要欄位：主單編號、商品料號、數量、商品單價或訂單狀態。');
+        }
+        const output = rows.slice(0, headerRow).map(row => row.slice());
+        const newHeader = header.slice(0, unitPriceIndex).concat(['商品定價', '商品單價', '活動折扣'], header.slice(unitPriceIndex + 1));
+        output.push(newHeader);
+        const working = [];
+        let cancelled = 0, unmapped = 0;
+        for (const row of rows.slice(headerRow + 1)) {
+          if (!row.some(value => value !== null && value !== '')) continue;
+          if (normal(row[statusIndex]) === '已取消') { cancelled++; continue; }
+          const listPrice = PRICE_MAP[sku(row[skuIndex])];
+          if (listPrice === undefined) unmapped++;
+          working.push({ row, order: normal(row[orderIndex]), listPrice, discount: listPrice === undefined ? null : (listPrice - number(row[unitPriceIndex])) * number(row[quantityIndex]) });
+        }
+        const groupDiscounts = new Map();
+        for (const item of working) groupDiscounts.set(item.order, (groupDiscounts.get(item.order) || 0) + (item.discount ?? 0));
+        const emitted = new Set();
+        for (const item of working) {
+          const discount = emitted.has(item.order) ? 0 : groupDiscounts.get(item.order);
+          emitted.add(item.order);
+          output.push(item.row.slice(0, unitPriceIndex).concat([item.listPrice ?? null, item.row[unitPriceIndex], discount], item.row.slice(unitPriceIndex + 1)));
+        }
+        const rebuilt = XLSX.utils.aoa_to_sheet(output);
+        rebuilt['!cols'] = (sheet['!cols'] || []).slice();
+        const baseWidth = rebuilt['!cols'][unitPriceIndex] || { wch: 12 };
+        rebuilt['!cols'].splice(unitPriceIndex, 1, { wch: 12 }, baseWidth, { wch: 12 });
+        return { changed: true, sheet: rebuilt, cancelled, unmapped, kept: working.length };
+      }
+
+      processButton.addEventListener('click', async () => {
+        if (!selectedFile) return;
+        if (!window.XLSX) { show('Excel 元件尚未載入。請確認網路連線後重新整理頁面。', true); return; }
+        processButton.disabled = true;
+        processButton.textContent = '整理中…';
+        try {
+          const data = await selectedFile.arrayBuffer();
+          const workbook = isTextFile(selectedFile.name)
+            ? XLSX.read(readTextFile(data), { type: 'string', cellDates: true })
+            : XLSX.read(data, { type: 'array', cellDates: true });
+          let sheets = 0, cancelled = 0, unmapped = 0, kept = 0;
+          for (const name of workbook.SheetNames) {
+            const transformed = transformSheet(workbook.Sheets[name]);
+            if (!transformed.changed) continue;
+            workbook.Sheets[name] = transformed.sheet;
+            sheets++; cancelled += transformed.cancelled; unmapped += transformed.unmapped; kept += transformed.kept;
+          }
+          if (!sheets) throw new Error('所有工作表均找不到包含「主單編號、商品料號、數量、商品單價、訂單狀態」的標題列。');
+          const baseName = selectedFile.name.replace(/\.[^.]+$/, '');
+          XLSX.writeFile(workbook, `${baseName}_已整理.xlsx`, { bookType: 'xlsx', compression: true });
+          show(`完成：已整理 ${sheets} 個工作表，保留 ${kept} 筆資料，排除 ${cancelled} 筆已取消資料。${unmapped ? `另有 ${unmapped} 筆商品料號未在定價對照表中，R、T 欄保留空白或未納入折扣。` : ''}`);
+        } catch (error) {
+          console.error(error);
+          show(`無法完成整理：${error.message || error}`, true);
+        } finally {
+          processButton.disabled = false;
+          processButton.textContent = '整理並下載 .xlsx';
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
